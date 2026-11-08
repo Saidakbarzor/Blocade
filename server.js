@@ -1,154 +1,288 @@
-// Blockade online server: node server.js  (нужен пакет ws, переменная BOT_TOKEN для Telegram)
-const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
-const {WebSocketServer}=require('ws');
-const PORT=process.env.PORT||3000,TOKEN=process.env.BOT_TOKEN||'',T0=180000;
-const DB=path.join(__dirname,'ratings.json');
-let ratings={};try{ratings=JSON.parse(fs.readFileSync(DB,'utf8'));}catch(e){}
-const saveR=()=>fs.writeFile(DB,JSON.stringify(ratings),()=>{});
-const getR=id=>ratings[id]||800;
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 
-const srv=http.createServer((q,s)=>{
-  if(q.url==='/health'){s.end('ok');return;}
-  fs.readFile(path.join(__dirname,'index.html'),(e,d)=>{
-    if(e){s.writeHead(500);return s.end('index.html not found');}
-    s.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});s.end(d);
-  });
-});
-const wss=new WebSocketServer({server:srv,maxPayload:4096});
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+app.use(express.static(path.join(__dirname, 'public')));
 
-// ---------- Правила (канонические координаты: игрок 0 снизу, идёт к ряду 0) ----------
-const N=9,D=[[1,0],[-1,0],[0,1],[0,-1]];
-const inside=(r,c)=>r>=0&&r<N&&c>=0&&c<N;
-const grid=()=>Array.from({length:8},()=>Array(8).fill(0));
-function blocked(r,c,nr,nc,H,V){
-  if(nr!==r){const a=Math.min(r,nr);return (c<8&&H[a][c]>0)||(c>0&&H[a][c-1]>0);}
-  const b=Math.min(c,nc);return (r<8&&V[r][b]>0)||(r>0&&V[r-1][b]>0);
+/* ---------- База игроков (файл data.json) ---------- */
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'data.json');
+let users = {};
+try { users = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) {}
+let dirty = false;
+const save = () => { dirty = true; };
+setInterval(() => { if (dirty) { dirty = false; fs.writeFile(DB_FILE, JSON.stringify(users), () => {}); } }, 5000);
+
+const COUNTRIES = ['UZ','RU','KZ','KG','TJ','TM','AZ','AM','GE','UA','BY','TR','US','GB','DE','FR','ES','IT','CN','JP','KR','IN','BR','MA','EG','SA','AE','PL','CL','CU'];
+const pub = (u) => u && u.nick ? { id: u.id, nick: u.nick, country: u.country, rating: u.rating, games: u.games, wins: u.wins } : null;
+
+/* ---------- Проверка Telegram ---------- */
+function tgUser(initData) {
+  if (!initData || !process.env.BOT_TOKEN) return null;
+  try {
+    const p = new URLSearchParams(initData);
+    const hash = p.get('hash'); p.delete('hash');
+    const str = [...p.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => k + '=' + v).join('\n');
+    const secret = crypto.createHmac('sha256', 'WebAppData').update(process.env.BOT_TOKEN).digest();
+    if (crypto.createHmac('sha256', secret).update(str).digest('hex') !== hash) return null;
+    return JSON.parse(p.get('user'));
+  } catch (e) { return null; }
 }
-function moves(me,opp,H,V){
-  const out=[];
-  for(const[dr,dc]of D){
-    const nr=me.r+dr,nc=me.c+dc;
-    if(!inside(nr,nc)||blocked(me.r,me.c,nr,nc,H,V))continue;
-    if(nr===opp.r&&nc===opp.c){
-      const jr=nr+dr,jc=nc+dc;
-      if(inside(jr,jc)&&!blocked(nr,nc,jr,jc,H,V))out.push({r:jr,c:jc});
-      else for(const[pr,pc]of D){
-        if(pr*dr+pc*dc!==0)continue;
-        const sr=nr+pr,sc=nc+pc;
-        if(inside(sr,sc)&&!blocked(nr,nc,sr,sc,H,V))out.push({r:sr,c:sc});
-      }
-    }else out.push({r:nr,c:nc});
+
+/* ---------- Правила игры ---------- */
+const MODES = {
+  classic: { s: [[4, 8], [4, 0]], goal: (i, x, y) => y === (i ? 8 : 0) },
+  finish:  { s: [[1, 6], [7, 6]], goal: (i, x, y) => y === 0 },
+  quad:    { s: [[4, 8], [4, 0], [0, 4], [8, 4]], goal: (i, x, y) => x === 4 && y === 4 }
+};
+const TIMES = { dash: [180000, 1000], sprint: [45000, 1000] };
+const D = [[0, 1], [0, -1], [1, 0], [-1, 0]];
+const inb = (x, y) => x >= 0 && y >= 0 && x < 9 && y < 9;
+const has = (g, o, x, y) => g.set.has(o + x + ',' + y);
+
+function blocked(g, x, y, dx, dy) {
+  if (dy === 1) return has(g, 'h', x, y) || has(g, 'h', x - 1, y);
+  if (dy === -1) return has(g, 'h', x, y - 1) || has(g, 'h', x - 1, y - 1);
+  if (dx === 1) return has(g, 'v', x, y) || has(g, 'v', x, y - 1);
+  return has(g, 'v', x - 1, y) || has(g, 'v', x - 1, y - 1);
+}
+
+function moves(g, pi) {
+  const me = g.pl[pi], res = [];
+  const occ = (x, y) => g.pl.some((q, j) => j !== pi && q.alive && q.x === x && q.y === y);
+  for (const [dx, dy] of D) {
+    const nx = me.x + dx, ny = me.y + dy;
+    if (!inb(nx, ny) || blocked(g, me.x, me.y, dx, dy)) continue;
+    if (!occ(nx, ny)) { res.push([nx, ny]); continue; }
+    const jx = nx + dx, jy = ny + dy;
+    if (inb(jx, jy) && !blocked(g, nx, ny, dx, dy) && !occ(jx, jy)) { res.push([jx, jy]); continue; }
+    for (const [sx, sy] of (dx ? [[0, 1], [0, -1]] : [[1, 0], [-1, 0]])) {
+      const tx = nx + sx, ty = ny + sy;
+      if (inb(tx, ty) && !blocked(g, nx, ny, sx, sy) && !occ(tx, ty)) res.push([tx, ty]);
+    }
   }
-  return out;
+  return res;
 }
-function pathLen(from,goal,H,V){
-  const d=Array.from({length:N},()=>Array(N).fill(-1)),q=[[from.r,from.c]];d[from.r][from.c]=0;
-  for(let i=0;i<q.length;i++){
-    const[r,c]=q[i];if(r===goal)return d[r][c];
-    for(const[dr,dc]of D){const nr=r+dr,nc=c+dc;
-      if(inside(nr,nc)&&d[nr][nc]<0&&!blocked(r,c,nr,nc,H,V)){d[nr][nc]=d[r][c]+1;q.push([nr,nc]);}}
+
+function hasPath(g, i) {
+  const p = g.pl[i], seen = new Set([p.x + ',' + p.y]), q = [[p.x, p.y]];
+  while (q.length) {
+    const [x, y] = q.shift();
+    if (g.M.goal(i, x, y)) return true;
+    for (const [dx, dy] of D) {
+      const nx = x + dx, ny = y + dy, k = nx + ',' + ny;
+      if (inb(nx, ny) && !seen.has(k) && !blocked(g, x, y, dx, dy)) { seen.add(k); q.push([nx, ny]); }
+    }
   }
-  return Infinity;
-}
-function canWall(g,o,r,c){
-  if((o!=='h'&&o!=='v')||r<0||c<0||r>7||c>7)return false;
-  const{H,V}=g;if(H[r][c]||V[r][c])return false;
-  if(o==='h'){if((c>0&&H[r][c-1])||(c<7&&H[r][c+1]))return false;}
-  else if((r>0&&V[r-1][c])||(r<7&&V[r+1][c]))return false;
-  const t=o==='h'?H:V;t[r][c]=9;
-  const ok=pathLen(g.pos[0],0,H,V)<Infinity&&pathLen(g.pos[1],8,H,V)<Infinity;t[r][c]=0;return ok;
+  return false;
 }
 
-// ---------- Проверка пользователя Telegram ----------
-function verify(initData){
-  try{
-    const p=new URLSearchParams(initData),hash=p.get('hash');p.delete('hash');
-    const check=[...p.entries()].map(([k,v])=>`${k}=${v}`).sort().join('\n');
-    const secret=crypto.createHmac('sha256','WebAppData').update(TOKEN).digest();
-    const h=crypto.createHmac('sha256',secret).update(check).digest('hex');
-    if(!hash||h!==hash)return null;
-    if(Date.now()/1000-Number(p.get('auth_date'))>86400)return null;
-    const u=JSON.parse(p.get('user'));return{id:'tg'+u.id,name:String(u.first_name||'Игрок').slice(0,20)};
-  }catch(e){return null;}
+function wallOk(g, o, x, y) {
+  if (o !== 'h' && o !== 'v') return false;
+  if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x > 7 || y > 7) return false;
+  const O = o === 'h' ? 'v' : 'h';
+  if (has(g, o, x, y) || has(g, O, x, y)) return false;
+  if (o === 'h' && (has(g, 'h', x - 1, y) || has(g, 'h', x + 1, y))) return false;
+  if (o === 'v' && (has(g, 'v', x, y - 1) || has(g, 'v', x, y + 1))) return false;
+  g.set.add(o + x + ',' + y);
+  const ok = g.pl.every((p, i) => !p.alive || hasPath(g, i));
+  g.set.delete(o + x + ',' + y);
+  return ok;
 }
 
-// ---------- Игры ----------
-const queue=[];
-const send=(ws,o)=>{if(ws.readyState===1)ws.send(JSON.stringify(o));};
-function flipW(M,i){
-  const out=grid();
-  for(let r=0;r<8;r++)for(let c=0;c<8;c++){
-    const v=M[r][c];if(!v)continue;const rel=(v-1===i)?1:2;
-    if(i===1)out[7-r][7-c]=rel;else out[r][c]=rel;
-  }
-  return out;
-}
-function view(g,i){
-  const f=p=>i===1?{r:8-p.r,c:8-p.c}:{r:p.r,c:p.c};
-  return{t:'state',me:f(g.pos[i]),opp:f(g.pos[1-i]),H:flipW(g.H,i),V:flipW(g.V,i),
-    left:{p:g.left[i],a:g.left[1-i]},turn:g.turn===i?'p':'a',
-    tm:{p:Math.max(0,g.tm[i]),a:Math.max(0,g.tm[1-i])},started:g.started};
-}
-const push=g=>g.p.forEach((w,i)=>send(w,view(g,i)));
-function spend(g){const n=Date.now();if(g.started)g.tm[g.turn]-=n-g.last;g.last=n;}
+/* ---------- Игры ---------- */
+const games = {};
+const queues = {};
 
-function startGame(pair){
-  const g={p:pair,pos:[{r:8,c:4},{r:0,c:4}],H:grid(),V:grid(),left:[10,10],turn:0,tm:[T0,T0],started:false,last:Date.now(),over:false};
-  pair.forEach((w,i)=>{w.game=g;const o=pair[1-i].user;send(w,{t:'start',col:i,opp:{name:o.name,rating:getR(o.id)}});});
+function snap(g, i) {
+  const now = Date.now();
+  return {
+    mode: g.mode, turn: g.turn, walls: g.walls,
+    pl: g.pl.map((p, k) => ({
+      nick: p.u.nick, country: p.u.country, rating: p.u.rating,
+      x: p.x, y: p.y, w: p.w, alive: p.alive,
+      ms: Math.max(0, p.ms - (k === g.turn && p.alive ? now - g.t0 : 0))
+    })),
+    moves: g.turn === i && g.pl[i].alive ? moves(g, i) : []
+  };
+}
+const push = (g) => g.pl.forEach((p, i) => { if (p.s.gid === g.id) p.s.emit('state', snap(g, i)); });
+
+function createGame(es, mode, time) {
+  const M = MODES[mode], [ms, inc] = TIMES[time];
+  es.sort(() => Math.random() - 0.5);
+  const g = {
+    id: 'g' + Math.random().toString(36).slice(2, 10), mode, M, inc, set: new Set(), walls: [],
+    turn: 0, t0: Date.now(), over: false,
+    pl: es.map((e, i) => ({ s: e.s, u: e.s.user, x: M.s[i][0], y: M.s[i][1], w: 10, alive: true, ms }))
+  };
+  games[g.id] = g;
+  g.pl.forEach((p, i) => { p.s.gid = g.id; p.s.idx = i; p.s.emit('match_found', { you: i, mode, total: g.pl.length }); });
   push(g);
-  g.timer=setInterval(()=>{if(g.over)return;spend(g);if(g.tm[g.turn]<=0)finish(g,1-g.turn,'time');},250);
-}
-function finish(g,winner,why){
-  if(g.over)return;g.over=true;clearInterval(g.timer);
-  const ids=g.p.map(w=>w.user.id),ra=getR(ids[0]),rb=getR(ids[1]);
-  const E=1/(1+Math.pow(10,(rb-ra)/400)),d=Math.round(32*((winner===0?1:0)-E));
-  ratings[ids[0]]=Math.max(100,ra+d);ratings[ids[1]]=Math.max(100,rb-d);saveR();
-  g.p.forEach((w,i)=>{
-    const win=winner===i;
-    const text={goal:win?'ты дошёл до цели':'соперник дошёл до цели',time:win?'у соперника вышло время':'у тебя вышло время',
-      resign:win?'соперник сдался или отключился':'ты сдался'}[why];
-    send(w,{t:'end',win,why:text,rating:ratings[ids[i]],delta:ratings[ids[i]]-(i===0?ra:rb)});
-    w.game=null;
-  });
 }
 
-wss.on('connection',ws=>{
-  ws.user=null;ws.game=null;
-  ws.on('message',raw=>{
-    let m;try{m=JSON.parse(raw);}catch(e){return;}
-    if(m.t==='auth'){
-      const u=TOKEN?verify(String(m.initData||'')):{id:'dev'+Math.random().toString(36).slice(2,8),name:String(m.name||'Игрок').slice(0,20)};
-      if(!u)return send(ws,{t:'err',msg:'Ошибка авторизации: открой игру из Telegram'});
-      ws.user=u;return send(ws,{t:'hello',rating:getR(u.id)});
-    }
-    if(!ws.user)return;
-    if(m.t==='find'){
-      if(ws.game||queue.includes(ws))return;
-      let bi=-1,bd=1e9;
-      queue.forEach((q,i)=>{if(q.user.id===ws.user.id)return;const d=Math.abs(getR(q.user.id)-getR(ws.user.id));if(d<bd){bd=d;bi=i;}});
-      if(bi<0){queue.push(ws);return send(ws,{t:'wait'});}
-      const o=queue.splice(bi,1)[0];startGame(Math.random()<0.5?[ws,o]:[o,ws]);
-    }else if(m.t==='cancel'){const i=queue.indexOf(ws);if(i>=0)queue.splice(i,1);}
-    else if(m.t==='resign'){const g=ws.game;if(g&&!g.over)finish(g,1-g.p.indexOf(ws),'resign');}
-    else if(m.t==='move'||m.t==='wall'){
-      const g=ws.game;if(!g||g.over)return;
-      const i=g.p.indexOf(ws);if(g.turn!==i)return;
-      spend(g);if(g.tm[i]<=0)return finish(g,1-i,'time');
-      const r=m.r|0,c=m.c|0;
-      if(m.t==='move'){
-        if(!moves(g.pos[i],g.pos[1-i],g.H,g.V).some(x=>x.r===r&&x.c===c))return send(ws,view(g,i));
-        g.pos[i]={r,c};if(r===(i===0?0:8)){return finish(g,i,'goal');}
-      }else{
-        if(g.left[i]<=0||!canWall(g,m.o,r,c))return send(ws,view(g,i));
-        (m.o==='h'?g.H:g.V)[r][c]=i+1;g.left[i]--;
-      }
-      if(i===0)g.started=true;
-      g.last=Date.now();g.turn=1-i;push(g);
+function nextTurn(g) {
+  do { g.turn = (g.turn + 1) % g.pl.length; } while (!g.pl[g.turn].alive);
+  g.t0 = Date.now();
+}
+
+function finish(g, w, reason) {
+  if (g.over) return;
+  g.over = true;
+  const deltas = g.pl.map(() => 0);
+  if (g.pl.length === 2) {
+    const a = g.pl[w].u.rating, b = g.pl[1 - w].u.rating;
+    const d = Math.round(32 * (1 - 1 / (1 + Math.pow(10, (b - a) / 400))));
+    deltas[w] = d; deltas[1 - w] = -d;
+  } else {
+    g.pl.forEach((p, i) => { deltas[i] = i === w ? 20 : -7; });
+  }
+  g.pl.forEach((p, i) => {
+    p.u.rating = Math.max(100, p.u.rating + deltas[i]);
+    p.u.games++; if (i === w) p.u.wins++;
+  });
+  save();
+  g.pl.forEach((p, i) => {
+    if (p.s.gid === g.id) {
+      p.s.emit('game_over', { winner: w, reason, delta: deltas[i], you: i });
+      p.s.emit('profile', pub(p.u));
+      p.s.gid = null;
     }
   });
-  ws.on('close',()=>{
-    const i=queue.indexOf(ws);if(i>=0)queue.splice(i,1);
-    const g=ws.game;if(g&&!g.over)finish(g,1-g.p.indexOf(ws),'resign');
+  delete games[g.id];
+}
+
+function eliminate(g, i, reason) {
+  if (g.over || !g.pl[i].alive) return;
+  g.pl[i].alive = false;
+  const alive = g.pl.map((p, k) => k).filter((k) => g.pl[k].alive);
+  if (alive.length === 1) return finish(g, alive[0], reason);
+  if (g.turn === i) nextTurn(g);
+  push(g);
+}
+
+function act(s, fn) {
+  const g = games[s.gid];
+  if (!g || g.over || g.turn !== s.idx) return;
+  const p = g.pl[s.idx];
+  if (p.ms - (Date.now() - g.t0) <= 0) return eliminate(g, s.idx, 'timeout');
+  if (!fn(g, p)) return s.emit('err', 'Недопустимый ход');
+  if (g.over) return;
+  p.ms = p.ms - (Date.now() - g.t0) + g.inc;
+  nextTurn(g);
+  push(g);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const id in games) {
+    const g = games[id];
+    if (!g.over && g.pl[g.turn].ms - (now - g.t0) <= 0) eliminate(g, g.turn, 'timeout');
+  }
+}, 250);
+
+/* ---------- Подбор соперника ---------- */
+function dequeue(s) { for (const k in queues) queues[k] = queues[k].filter((e) => e.s !== s); }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const key in queues) {
+    const [mode, time] = key.split(':');
+    let q = queues[key].filter((e) => e.s.connected);
+    if (mode === 'quad') {
+      while (q.length >= 4) createGame(q.splice(0, 4), mode, time);
+    } else {
+      q.sort((a, b) => a.s.user.rating - b.s.user.rating);
+      for (let i = 0; i < q.length - 1; i++) {
+        const a = q[i], b = q[i + 1];
+        const win = 100 + 60 * Math.max(now - a.t, now - b.t) / 1000;
+        if (Math.abs(a.s.user.rating - b.s.user.rating) <= win) {
+          createGame([a, b], mode, time);
+          q.splice(i, 2); i--;
+        }
+      }
+    }
+    queues[key] = q;
+  }
+}, 1000);
+
+/* ---------- Сокеты ---------- */
+io.on('connection', (s) => {
+  s.user = null; s.gid = null;
+
+  s.on('auth', ({ initData, guestId } = {}) => {
+    let id = null, name = '';
+    const t = tgUser(initData);
+    if (t) { id = 'tg' + t.id; name = t.first_name || t.username || ''; }
+    else if (process.env.ALLOW_GUEST !== 'false' && typeof guestId === 'string' && /^[\w-]{6,40}$/.test(guestId)) id = 'g' + guestId;
+    if (!id) return s.emit('auth_fail', 'Открой игру через Telegram');
+    if (!users[id]) users[id] = { id, nick: null, country: null, rating: 1000, games: 0, wins: 0 };
+    s.user = users[id];
+    s.emit('auth_ok', { profile: pub(s.user), suggest: name.replace(/[^\w.\-а-яА-ЯёЁ]/g, '').slice(0, 16), countries: COUNTRIES });
+  });
+
+  s.on('register', ({ nick, country } = {}) => {
+    if (!s.user || s.user.nick) return;
+    nick = String(nick || '').trim();
+    if (!/^[\wа-яА-ЯёЁ.\-]{3,16}$/.test(nick)) return s.emit('reg_err', 'Ник: 3–16 символов, буквы, цифры, _ . -');
+    if (!COUNTRIES.includes(country)) return s.emit('reg_err', 'Выбери страну');
+    if (Object.values(users).some((u) => u.nick && u.nick.toLowerCase() === nick.toLowerCase())) return s.emit('reg_err', 'Этот ник уже занят');
+    s.user.nick = nick; s.user.country = country; save();
+    s.emit('profile', pub(s.user));
+    s.emit('registered');
+  });
+
+  s.on('find_match', ({ mode, time } = {}) => {
+    if (!s.user || !s.user.nick || !MODES[mode] || !TIMES[time]) return;
+    const g = games[s.gid];
+    if (g && !g.over && g.pl[s.idx].alive) return;
+    s.gid = null; dequeue(s);
+    const key = mode + ':' + time;
+    (queues[key] = queues[key] || []).push({ s, t: Date.now() });
+  });
+
+  s.on('cancel_search', () => dequeue(s));
+  s.on('move', ({ x, y } = {}) => act(s, (g, p) => {
+    if (!moves(g, s.idx).some((m) => m[0] === x && m[1] === y)) return false;
+    p.x = x; p.y = y;
+    if (g.M.goal(s.idx, x, y)) finish(g, s.idx, 'goal');
+    return true;
+  }));
+  s.on('wall', ({ o, x, y } = {}) => act(s, (g, p) => {
+    if (p.w <= 0 || !wallOk(g, o, x, y)) return false;
+    g.set.add(o + x + ',' + y); g.walls.push({ o, x, y, p: s.idx }); p.w--;
+    return true;
+  }));
+  s.on('surrender', () => {
+    const g = games[s.gid];
+    if (g) { const i = s.idx; eliminate(g, i, 'surrender'); if (s.gid === g.id && g.pl[i]) s.gid = null; }
+  });
+  s.on('emoji', ({ e } = {}) => {
+    const g = games[s.gid];
+    if (!g || !['😂', '🤔', '😎', '😱', '😡'].includes(e)) return;
+    g.pl.forEach((p) => { if (p.s.gid === g.id) p.s.emit('emoji', { from: s.idx, e }); });
+  });
+
+  s.on('leaders', ({ scope } = {}) => {
+    if (!s.user) return;
+    let all = Object.values(users).filter((u) => u.nick && u.games > 0);
+    if (scope === 'country') all = all.filter((u) => u.country === s.user.country);
+    all.sort((a, b) => b.rating - a.rating);
+    const idx = all.findIndex((u) => u.id === s.user.id);
+    s.emit('leaders', { rows: all.slice(0, 50).map(pub), rank: idx >= 0 ? idx + 1 : null });
+  });
+
+  s.on('disconnect', () => {
+    dequeue(s);
+    const g = games[s.gid];
+    if (g) eliminate(g, s.idx, 'disconnect');
   });
 });
-srv.listen(PORT,()=>console.log('Blockade server on :'+PORT));
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));

@@ -1,1 +1,13 @@
-{"name":"blockade","version":"1.0.0","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"ws":"^8.18.0"}}
+{
+  "name": "blocade-mini-app",
+  "version": "1.0.0",
+  "description": "Blocade Multiplayer Mini App",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
